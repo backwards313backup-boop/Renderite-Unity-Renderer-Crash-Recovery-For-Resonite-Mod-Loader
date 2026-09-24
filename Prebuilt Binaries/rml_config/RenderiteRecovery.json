@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "values": {
+    "recovery_attempts": 10,
+    "stable_seconds": 120,
+    "journal_limit_mb": 0,
+    "journal_entry_limit": 0,
+    "archive_disk_limit_mb": 0,
+    "archive_directory": "",
+    "archive_memory_mb": 2048,
+    "compaction_threshold_mb": 512,
+    "show_dash_panel": true,
+    "write_log_files": true,
+    "asset_quarantine": true,
+    "exit_when_recovery_fails": true
+  }
+}

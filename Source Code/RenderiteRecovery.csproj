@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>RenderiteRecovery</AssemblyName>
+    <RootNamespace>RenderiteRecovery</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="FrooxEngine" HintPath="$(ResonitePath)\FrooxEngine.dll" Private="false" />
+    <Reference Include="Elements.Core" HintPath="$(ResonitePath)\Elements.Core.dll" Private="false" />
+    <Reference Include="Elements.Assets" HintPath="$(ResonitePath)\Elements.Assets.dll" Private="false" />
+    <Reference Include="Renderite.Shared" HintPath="$(ResonitePath)\Renderite.Shared.dll" Private="false" />
+    <PackageReference Include="ResoniteModLoader" Version="5.0.1" ExcludeAssets="runtime" />
+  </ItemGroup>
+</Project>
