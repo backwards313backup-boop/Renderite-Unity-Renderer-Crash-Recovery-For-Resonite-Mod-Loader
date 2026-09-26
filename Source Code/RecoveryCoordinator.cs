@@ -16,6 +16,8 @@ internal static class RecoveryCoordinator
     private static readonly CommandJournal Journal = new();
     private static readonly ReplayPool Pool = new();
     private static readonly AsyncLocal<bool> RecoverySend = new();
+    private static readonly HashSet<int> MeshesNeedingFullUpload = new();
+    private static volatile bool _anyMeshNeedsFullUpload;
     private static readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> ReplayAcks = new();
     private static readonly SemaphoreSlim FrameStarts = new(0);
     private static readonly MethodInfo HandleCommandMethod = AccessTools.Method(typeof(RenderSystem), "HandleCommand");
@@ -102,6 +104,10 @@ internal static class RecoveryCoordinator
     internal static Dictionary<(string Family, int AssetId), long>? UploadBytesByAsset() =>
         Journal.CanRecord ? Journal.UploadBytesByAsset() : null;
 
+    internal static CommandJournal.Composition? JournalComposition() => Journal.Describe();
+
+    internal static CommandJournal.Contents JournalContents() => Journal.ListContents();
+
     internal static StatusReport GetStatus()
     {
         (int entries, long journalBytes) = Journal.Usage;
@@ -172,8 +178,10 @@ internal static class RecoveryCoordinator
             if (renderSystem is not null)
                 _renderSystem = renderSystem;
 
+            long captureStart = JournalTelemetry.Now();
             IReadOnlyList<PayloadArchiver.Buffer> buffers = renderSystem is null
-                ? Array.Empty<PayloadArchiver.Buffer>() : PayloadArchiver.Capture(command, renderSystem);
+                ? Array.Empty<PayloadArchiver.Buffer>() : PayloadArchiver.CaptureForJournal(command, renderSystem);
+            JournalTelemetry.Add(JournalTelemetry.Stage.Capture, captureStart);
             Journal.Record(command, background, buffers);
         }
         catch (Exception ex) { Journal.Invalidate($"Could not journal {command.GetType().Name}: {ex.Message}"); }
@@ -244,6 +252,7 @@ internal static class RecoveryCoordinator
         if (RecoverySend.Value)
             return;
 
+        CompleteSkippedMesh(command);
         InFlightRequests.Sent(command);
         AssetQuarantine.NoteSent(command);
         if (command is not MaterialsUpdateBatch batch || !PropertyIdMap.IsTranslating)
@@ -299,8 +308,10 @@ internal static class RecoveryCoordinator
         }
         RenderiteRecoveryMod.Warn($"Renderer failure detected ({reason}), starting recovery (attempt {attempt} of {allowed}).");
         RendererDiagnostics.ObserveOriginal(EngineStartUtc());
-        RendererDiagnostics.ReportStopped(reason);
         bool deliberate = IsDeliberateKill(renderSystem.RendererProcess);
+        if (!deliberate)
+            RendererDiagnostics.ReportStopped(reason);
+
         AssetQuarantine.RendererDied(InFlightRequests.OutstandingAssets(), deliberate);
         InFlightRequests.Orphan();
         MaterialRefresh.Begin(renderSystem.Engine);
@@ -553,6 +564,9 @@ internal static class RecoveryCoordinator
             var formatted = new HashSet<(string Family, int AssetId)>();
             var unformatted = new SortedSet<int>();
             int skippedUploads = 0;
+            int staleLiveBuffers = 0;
+            int staleMeshes = 0;
+            int freedMeshes = 0;
             lock (RecentReplay) RecentReplay.Clear();
             Volatile.Write(ref _replaying, 1);
 
@@ -595,7 +609,31 @@ internal static class RecoveryCoordinator
                 using (ResourceMetrics.Measure(ResourceMetrics.Area.Recovery))
                 {
                     command = CommandJournal.Deserialize(entry.Payload, Pool);
-                    leases = PayloadArchiver.Rehydrate(command, renderSystem, entry.Buffers);
+                    try { leases = PayloadArchiver.Rehydrate(command, renderSystem, entry.Buffers); }
+                    catch (PayloadArchiver.StalePayloadException stale)
+                    {
+                        if (command is MeshUploadData staleMesh)
+                        {
+                            if (stale.Changed)
+                                staleMeshes++;
+                            else
+                                freedMeshes++;
+
+                            lock (MeshesNeedingFullUpload)
+                            {
+                                MeshesNeedingFullUpload.Add(staleMesh.assetId);
+                                _anyMeshNeedsFullUpload = true;
+                            }
+                        }
+                        else
+                            staleLiveBuffers++;
+
+                        if (InFlightRequests.RequestKey(command) is string requestKey && AssetQuarantine.Reply(requestKey) is RendererCommand consumed)
+                            InFlightRequests.Adopt(consumed);
+
+                        taskbar.Report(++sent);
+                        return;
+                    }
                     if (command is MeshUploadData mesh)
                         mesh.uploadHint = CompleteMeshHint(mesh.uploadHint);
 
@@ -662,6 +700,15 @@ internal static class RecoveryCoordinator
                 SendRecoveryCommand(newHost, new UnloadTexture2D { assetId = AssetQuarantine.BarrierTextureId }, false);
             }
             Volatile.Write(ref _replaying, 0);
+            if (staleLiveBuffers > 0)
+                RenderiteRecoveryMod.Msg($"{staleLiveBuffers} particle or trail buffers changed or were freed since their last upload, so they were not replayed. The engine sends them again with its next particle update.");
+
+            if (staleMeshes > 0)
+                RenderiteRecoveryMod.Msg($"{staleMeshes} meshes changed since their last upload (the engine was already preparing the next one), so they were not replayed. Their next upload is sent in full.");
+
+            if (freedMeshes > 0)
+                RenderiteRecoveryMod.Warn($"{freedMeshes} meshes were no longer in the engine's memory and had no saved copy, so they were not replayed. Their next upload is sent in full. A mesh the engine never uploads again stays invisible until it reloads. Please report this with the log.");
+
             if (skippedUploads > 0)
                 RenderiteRecoveryMod.Warn($"Skipped {skippedUploads} texture uploads for {unformatted.Count} textures that had no format in the journal (assets {string.Join(", ", unformatted.Take(20))}{(unformatted.Count > 20 ? ", ..." : "")}). The renderer rejects data before a format, so these textures stay blank until they are reloaded. Please report this with the log.");
 
@@ -813,6 +860,7 @@ internal static class RecoveryCoordinator
                         PayloadArchiver.Release(deferred.Buffers);
                         continue;
                     }
+                    CompleteSkippedMesh(command);
                     Journal.Record(command, deferred.Background, deferred.Buffers);
                     InFlightRequests.Sent(command);
                     if (command is MaterialsUpdateBatch batch)
@@ -1035,6 +1083,30 @@ internal static class RecoveryCoordinator
 
             _retained.Clear();
         }
+    }
+
+    internal static void MeshBufferFreeing(Mesh mesh)
+    {
+        if (MeshBufferFreePatch.BufferOf(mesh)?.Data is not SharedMemoryBlockLease { Manager: { } manager } lease)
+            return;
+
+        Journal.PreserveLive(nameof(MeshUploadData), ((IRendererAsset)mesh).AssetId, manager.Id, lease.BlockBytesStart,
+            lease.BlockBytesSize, lease.RawData);
+    }
+
+    private static void CompleteSkippedMesh(RendererCommand command)
+    {
+        if (!_anyMeshNeedsFullUpload || command is not MeshUploadData mesh)
+            return;
+
+        lock (MeshesNeedingFullUpload)
+        {
+            if (!MeshesNeedingFullUpload.Remove(mesh.assetId))
+                return;
+
+            _anyMeshNeedsFullUpload = MeshesNeedingFullUpload.Count > 0;
+        }
+        mesh.uploadHint = CompleteMeshHint(mesh.uploadHint);
     }
 
     private static MeshUploadHint CompleteMeshHint(MeshUploadHint hint)

@@ -76,21 +76,24 @@ internal static class WorldSize
         if (asset.Owner is not null || asset.AssetURL is null)
             return false;
 
+        return Requesters(asset).Any(requester => requester is IWorldElement element && element.World == world);
+    }
+
+    internal static List<object> Requesters(Asset asset)
+    {
         FieldInfo? field = RequestFields.GetOrAdd(asset.GetType(), static type => AccessTools.Field(type, "requests"));
         if (field?.GetValue(asset) is not IDictionary requests)
-            return false;
+            return [];
 
         object? gate = asset.VariantManager is AssetVariantManager manager ? VariantLock?.GetValue(manager) : null;
-        List<object> requesters;
         try
         {
             if (gate is null)
-                requesters = requests.Keys.Cast<object>().ToList();
-            else
-                lock (gate) requesters = requests.Keys.Cast<object>().ToList();
+                return requests.Keys.Cast<object>().ToList();
+
+            lock (gate) return requests.Keys.Cast<object>().ToList();
         }
-        catch (InvalidOperationException) { return false; }
-        return requesters.Any(requester => requester is IWorldElement element && element.World == world);
+        catch (InvalidOperationException) { return []; }
     }
 
     private static long TextureBytes(Texture2D texture)
@@ -120,7 +123,9 @@ internal static class WorldSize
 
     private static string PlainName(World world)
     {
-        string name = RichTextTag.Replace(world.Name ?? "", "").Trim();
+        string name = Plain(world.Name);
         return name.Length > 0 ? name : "Unnamed world";
     }
+
+    internal static string Plain(string? text) => RichTextTag.Replace(text ?? "", "").Trim();
 }

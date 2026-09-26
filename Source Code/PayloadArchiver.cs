@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Collections;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using FrooxEngine;
 using HarmonyLib;
 using Renderite.Shared;
@@ -21,7 +22,18 @@ internal static class PayloadArchiver
         {
             WriteFailed = RecoveryCoordinator.InvalidateJournal
         });
-    internal sealed record Buffer(int Id, int Capacity, int Offset, int Length, PayloadStore.Handle Storage);
+    internal sealed record Buffer(int Id, int Capacity, int Offset, int Length, PayloadStore.Handle? Storage, ulong? Hash)
+    {
+        public Buffer(int id, int capacity, int offset, int length, PayloadStore.Handle? storage)
+            : this(id, capacity, offset, length, storage, null)
+        {
+        }
+    }
+
+    internal sealed class StalePayloadException(string message, bool changed) : Exception(message)
+    {
+        internal bool Changed { get; } = changed;
+    }
 
     internal static long DiskLimit => Volatile.Read(ref _diskLimit);
     internal static long CompactionThreshold => Volatile.Read(ref _compactionThreshold);
@@ -59,7 +71,10 @@ internal static class PayloadArchiver
     internal static void Release(IReadOnlyList<Buffer> buffers)
     {
         foreach (Buffer buffer in buffers)
-            Store.Value.Release(buffer.Storage);
+        {
+            if (buffer.Storage is PayloadStore.Handle storage)
+                Store.Value.Release(storage);
+        }
     }
 
     private static readonly FieldInfo SharedMemoryField = AccessTools.Field(typeof(RenderSystem), "_sharedMemory");
@@ -86,6 +101,102 @@ internal static class PayloadArchiver
         }
 
         return null;
+    }
+
+    private static readonly FieldInfo? BlocksField = AccessTools.Field(typeof(SharedMemoryBlockManager), "blocks");
+    private static readonly PropertyInfo? SharedMemoryLock = AccessTools.Property(typeof(SharedMemoryManager), "Lock");
+
+    internal static bool ReadsLive(RendererCommand command) =>
+        BlocksField is not null && SharedMemoryLock is not null
+        && (command is PointRenderBufferUpload or TrailRenderBufferUpload || command is MeshUploadData && MeshBufferFreePatch.Active);
+
+    internal static Buffer Preserve(Buffer live, ReadOnlySpan<byte> data) => live with { Storage = Store.Value.Save(data) };
+
+    internal static IReadOnlyList<Buffer> CaptureForJournal(RendererCommand command, RenderSystem system)
+    {
+        if (!ReadsLive(command))
+            return Capture(command, system);
+
+        if (FindDescriptors(command) is not { } descriptors)
+            return Array.Empty<Buffer>();
+
+        var result = new List<Buffer>(descriptors.Count);
+        foreach (var descriptor in descriptors)
+        {
+            if (descriptor.Length <= 0)
+                continue;
+
+            ulong? hash = command is MeshUploadData
+                ? PayloadHash.Compute(Access(system, descriptor.Id, descriptor.Offset, descriptor.Length))
+                : null;
+            result.Add(new Buffer(descriptor.Id, descriptor.Capacity, descriptor.Offset, descriptor.Length, null, hash));
+        }
+        return result;
+    }
+
+    private static bool OwnedBy(RendererCommand command, object? owner) => command switch
+    {
+        MeshUploadData mesh => owner is Mesh asset && ((IRendererAsset)asset).AssetId == mesh.assetId,
+        _ => owner?.GetType().Namespace == "PhotonDust"
+    };
+
+    private static bool CopyLive(RenderSystem system, RendererCommand command, Buffer source, Span<byte> destination)
+    {
+        if (BlocksField is null || SharedMemoryLock is null || FindManager(system, source.Id) is not { } manager
+            || manager.Capacity != source.Capacity || SharedMemoryLock.GetValue(manager.Manager) is not { } gate)
+            return false;
+
+        lock (gate)
+        {
+            var blocks = (SortedList<int, SharedMemoryBlockLease>)BlocksField.GetValue(manager)!;
+            if (!blocks.TryGetValue(source.Offset, out SharedMemoryBlockLease? block) || block.BlockBytesSize != source.Length
+                || !OwnedBy(command, block.Owner))
+                return false;
+
+            manager.RawData.Slice(source.Offset, source.Length).CopyTo(destination);
+            return true;
+        }
+    }
+
+    private static bool Fits(int offset, int count, int stride, int length) =>
+        offset >= 0 && count >= 0 && (long)offset + (long)count * stride <= length;
+
+    private static bool IsConsistent(RendererCommand command, ReadOnlySpan<byte> data)
+    {
+        switch (command)
+        {
+            case PointRenderBufferUpload points:
+                return Fits(points.positionsOffset, points.count, 12, data.Length)
+                    && Fits(points.rotationsOffset, points.count, 16, data.Length)
+                    && Fits(points.sizesOffset, points.count, 12, data.Length)
+                    && Fits(points.colorsOffset, points.count, 16, data.Length)
+                    && (points.frameIndexesOffset < 0 || Fits(points.frameIndexesOffset, points.count, 2, data.Length));
+            case TrailRenderBufferUpload trails:
+                if (!Fits(trails.trailsOffset, trails.trailsCount, 16, data.Length)
+                    || !Fits(trails.positionsOffset, trails.trailPointCount, 12, data.Length)
+                    || !Fits(trails.colorsOffset, trails.trailPointCount, 16, data.Length)
+                    || !Fits(trails.sizesOffset, trails.trailPointCount, 4, data.Length))
+                    return false;
+
+                foreach (TrailOffset trail in MemoryMarshal.Cast<byte, TrailOffset>(data.Slice(trails.trailsOffset, trails.trailsCount * 16)))
+                {
+                    if (trail.count < 0 || trail.count > trail.capacity)
+                        return false;
+
+                    if (trail.count == 0)
+                        continue;
+
+                    if (trail.start < 0 || trail.start >= trail.capacity || trail.offset < 0)
+                        return false;
+
+                    long lastIndex = (long)trail.offset + ((long)trail.start + trail.count > trail.capacity ? trail.capacity - 1 : trail.start + trail.count - 1);
+                    if (lastIndex >= trails.trailPointCount)
+                        return false;
+                }
+                return true;
+            default:
+                return true;
+        }
     }
 
     internal static IReadOnlyList<Buffer> Capture(RendererCommand command, RenderSystem system)
@@ -156,7 +267,15 @@ internal static class PayloadArchiver
             Buffer archived = queue.Dequeue();
             var lease = (SharedMemoryBlockLease<byte>)AllocateBlockMethod.Invoke(
                 system, new object?[] { archived.Length, false, command })!;
-            try { Store.Value.Load(archived.Storage, lease.Data); }
+            try
+            {
+                if (archived.Storage is PayloadStore.Handle storage)
+                    Store.Value.Load(storage, lease.Data);
+                else if (!CopyLive(system, command, archived, lease.Data))
+                    throw new StalePayloadException($"{command.GetType().Name}: the engine's buffer {key} was freed since it was sent.", false);
+                else if (!IsConsistent(command, lease.Data) || archived.Hash is ulong expected && PayloadHash.Compute(lease.Data) != expected)
+                    throw new StalePayloadException($"{command.GetType().Name}: the engine's buffer {key} changed since it was sent.", true);
+            }
             catch { lease.Dispose(); throw; }
             leases.Add(lease);
             var fresh = lease.Descriptor;

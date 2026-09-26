@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 
 namespace RenderiteRecovery;
 
@@ -10,57 +11,110 @@ internal static class ResourceMetrics
         EngineHooks,
         Background,
         Recovery,
-        Panel
+        Panel,
+        Telemetry
     }
 
     internal static readonly Area[] Areas = Enum.GetValues<Area>();
     private const int SampleCount = 6;
+    private const int CommandSpacing = 128;
 
     private static readonly long[] Ticks = new long[Areas.Length];
+    private static readonly long[] Cycles = new long[Areas.Length];
     private static readonly long[] Allocated = new long[Areas.Length];
     private static readonly Sample[] Samples = new Sample[SampleCount];
     private static readonly object SampleGate = new();
+    private static long _engineTicks;
+    private static int _engineThread = -1;
     private static int _sampleCount;
     private static int _nextSample;
     private static long _lastSampleTick;
     private static long _frames;
-    [ThreadStatic] private static int _depth;
+    [ThreadStatic] private static ThreadState? _thread;
 
-    private sealed record Sample(long Timestamp, long[] Ticks, long[] Allocated, long Frames, TimeSpan ProcessCpu);
+    private sealed class ThreadState
+    {
+        internal int Depth;
+        internal int Countdown;
+        internal int Gap;
+    }
+
+    private sealed record Sample(long Timestamp, long[] Ticks, long[] Cycles, long[] Allocated, long EngineTicks, long Frames, TimeSpan ProcessCpu);
 
     internal readonly struct Scope : IDisposable
     {
+        private readonly ThreadState _state;
         private readonly int _area;
+        private readonly int _weight;
         private readonly long _start;
+        private readonly long _cycles;
         private readonly long _allocatedStart;
 
-        internal Scope(Area area)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal Scope(Area area, bool everyTime)
         {
-            if (_depth++ > 0)
+            ThreadState state = _thread ??= new ThreadState();
+            _state = state;
+            int weight = state.Depth++ > 0 ? 0 : everyTime ? 1 : --state.Countdown > 0 ? 0 : NextWeight(state);
+            if (weight == 0)
             {
                 _area = -1;
-                _start = _allocatedStart = 0;
+                _weight = 0;
+                _start = _cycles = _allocatedStart = 0;
                 return;
             }
             _area = (int)area;
-            _start = Stopwatch.GetTimestamp();
-            _allocatedStart = GC.GetAllocatedBytesForCurrentThread();
+            _weight = weight;
+            Begin(out _start, out _cycles, out _allocatedStart);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Dispose()
         {
-            _depth--;
-            if (_area < 0)
-                return;
+            _state.Depth--;
+            if (_area >= 0)
+                Record();
+        }
 
-            Interlocked.Add(ref Ticks[_area], Stopwatch.GetTimestamp() - _start);
-            Interlocked.Add(ref Allocated[_area], GC.GetAllocatedBytesForCurrentThread() - _allocatedStart);
+        private static void Begin(out long start, out long cycles, out long allocatedStart)
+        {
+            allocatedStart = GC.GetAllocatedBytesForCurrentThread();
+            cycles = ThreadCpu.Cycles();
+            start = Stopwatch.GetTimestamp();
+        }
+
+        private void Record()
+        {
+            long wall = (Stopwatch.GetTimestamp() - _start) * _weight;
+            long end = _cycles >= 0 ? ThreadCpu.Cycles() : -1;
+            Interlocked.Add(ref Ticks[_area], wall);
+            if (end >= _cycles && _cycles >= 0)
+                Interlocked.Add(ref Cycles[_area], (end - _cycles) * _weight);
+
+            if (Environment.CurrentManagedThreadId == Volatile.Read(ref _engineThread))
+                Interlocked.Add(ref _engineTicks, wall);
+
+            Interlocked.Add(ref Allocated[_area], (GC.GetAllocatedBytesForCurrentThread() - _allocatedStart) * _weight);
         }
     }
 
-    internal static Scope Measure(Area area) => new(area);
+    internal static Scope Measure(Area area) => new(area, true);
 
-    internal static void CountFrame() => Interlocked.Increment(ref _frames);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Scope MeasureCommand(Area area) => new(area, false);
+
+    private static int NextWeight(ThreadState state)
+    {
+        int weight = Math.Max(1, state.Gap);
+        state.Gap = state.Countdown = Random.Shared.Next(1, 2 * CommandSpacing);
+        return weight;
+    }
+
+    internal static void CountFrame()
+    {
+        Volatile.Write(ref _engineThread, Environment.CurrentManagedThreadId);
+        Interlocked.Increment(ref _frames);
+    }
 
     internal static long TotalAllocatedBytes
     {
@@ -88,7 +142,8 @@ internal static class ResourceMetrics
             processCpu = process.TotalProcessorTime;
         }
         catch (Exception) { processCpu = TimeSpan.Zero; }
-        var sample = new Sample(Stopwatch.GetTimestamp(), Read(Ticks), Read(Allocated), Volatile.Read(ref _frames), processCpu);
+        var sample = new Sample(Stopwatch.GetTimestamp(), Read(Ticks), Read(Cycles), Read(Allocated),
+            Interlocked.Read(ref _engineTicks), Volatile.Read(ref _frames), processCpu);
         lock (SampleGate)
         {
             Samples[_nextSample] = sample;
@@ -107,21 +162,29 @@ internal static class ResourceMetrics
         return copy;
     }
 
-    internal sealed record AreaUsage(Area Area, double CpuPercentOfCore, double AllocatedBytesPerSecond,
-        double TotalCpuSeconds, long TotalAllocatedBytes);
+    internal sealed record AreaUsage(Area Area, double ShareOfProcessPercent, double TotalCpuSeconds,
+        double AllocatedBytesPerSecond, long TotalAllocatedBytes);
 
     internal sealed record Report(
         IReadOnlyList<AreaUsage> Areas,
         double WindowSeconds,
-        double CpuPercentOfCore,
+        bool CpuMeasured,
+        double ShareOfProcessPercent,
+        double ShareOfMachinePercent,
+        double ProcessShareOfMachinePercent,
+        int LogicalProcessors,
+        double EngineMsPerFrame,
+        double EngineFramePercent,
+        double WaitingThreads,
         double AllocatedBytesPerSecond,
-        double HookMsPerFrame,
         double FramesPerSecond,
-        double ShareOfProcessCpuPercent,
         double TotalCpuSeconds);
 
     internal static Report? GetReport()
     {
+        if (ThreadCpu.Supported && !ThreadCpu.Ready)
+            return null;
+
         Sample oldest, newest;
         lock (SampleGate)
         {
@@ -131,35 +194,51 @@ internal static class ResourceMetrics
             newest = Samples[(_nextSample - 1 + SampleCount) % SampleCount];
             oldest = Samples[(_nextSample - _sampleCount + SampleCount) % SampleCount];
         }
-        double seconds = (newest.Timestamp - oldest.Timestamp) / (double)Stopwatch.Frequency;
+        double frequency = Stopwatch.Frequency;
+        double seconds = (newest.Timestamp - oldest.Timestamp) / frequency;
         if (seconds <= 0)
             return null;
 
-        var areas = new List<AreaUsage>(Areas.Length);
-        double cpuSeconds = 0, allocated = 0, totalCpu = 0, hookSeconds = 0;
+        bool measured = ThreadCpu.Ready;
+        double processCpu = (newest.ProcessCpu - oldest.ProcessCpu).TotalSeconds;
+        var cpuByArea = new double[Areas.Length];
+        double cpu = 0, wall = 0, allocated = 0, totalCpu = 0;
         foreach (Area area in Areas)
         {
             int i = (int)area;
-            double areaCpu = (newest.Ticks[i] - oldest.Ticks[i]) / (double)Stopwatch.Frequency;
-            double areaAllocated = newest.Allocated[i] - oldest.Allocated[i];
-            double areaTotal = newest.Ticks[i] / (double)Stopwatch.Frequency;
-            areas.Add(new AreaUsage(area, areaCpu / seconds * 100, areaAllocated / seconds, areaTotal, newest.Allocated[i]));
-            cpuSeconds += areaCpu;
-            allocated += areaAllocated;
-            totalCpu += areaTotal;
-            if (area is Area.Recording or Area.EngineHooks)
-                hookSeconds += areaCpu;
+            double areaWall = (newest.Ticks[i] - oldest.Ticks[i]) / frequency;
+            cpuByArea[i] = measured ? ThreadCpu.Seconds(newest.Cycles[i] - oldest.Cycles[i]) : areaWall;
+            cpu += cpuByArea[i];
+            wall += areaWall;
+            allocated += newest.Allocated[i] - oldest.Allocated[i];
+            totalCpu += measured ? ThreadCpu.Seconds(newest.Cycles[i]) : newest.Ticks[i] / frequency;
         }
+        var areas = new List<AreaUsage>(Areas.Length);
+        foreach (Area area in Areas)
+        {
+            int i = (int)area;
+            areas.Add(new AreaUsage(area, Share(cpuByArea[i], processCpu),
+                measured ? ThreadCpu.Seconds(newest.Cycles[i]) : newest.Ticks[i] / frequency,
+                (newest.Allocated[i] - oldest.Allocated[i]) / seconds, newest.Allocated[i]));
+        }
+        int processors = Math.Max(1, Environment.ProcessorCount);
         long frames = newest.Frames - oldest.Frames;
-        double processCpu = (newest.ProcessCpu - oldest.ProcessCpu).TotalSeconds;
+        double engineSeconds = (newest.EngineTicks - oldest.EngineTicks) / frequency;
         return new Report(
             areas,
             seconds,
-            cpuSeconds / seconds * 100,
+            measured,
+            Share(cpu, processCpu),
+            Math.Min(100, cpu / (seconds * processors) * 100),
+            Math.Min(100, processCpu / (seconds * processors) * 100),
+            processors,
+            frames > 0 ? engineSeconds * 1000 / frames : 0,
+            Math.Min(100, engineSeconds / seconds * 100),
+            measured ? Math.Max(0, wall - cpu) / seconds : 0,
             allocated / seconds,
-            frames > 0 ? hookSeconds * 1000 / frames : 0,
             frames / seconds,
-            processCpu > 0 ? Math.Min(100, cpuSeconds / processCpu * 100) : 0,
             totalCpu);
     }
+
+    private static double Share(double part, double whole) => whole > 0 ? Math.Min(100, part / whole * 100) : 0;
 }

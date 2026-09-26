@@ -67,6 +67,7 @@ internal sealed unsafe class PayloadStore : IDisposable
     private Thread? _writer;
     private long _memoryBytes;
     private long _pendingBytes;
+    private long _liveBytes;
     private string? _directory;
     private string? _warnedDirectory;
     private Segment _active;
@@ -126,10 +127,7 @@ internal sealed unsafe class PayloadStore : IDisposable
         get { lock (_gate) return System.IO.Path.GetDirectoryName(_active.Path) ?? ""; }
     }
 
-    internal long LiveBytes
-    {
-        get { lock (_gate) return _memoryBytes + _pendingBytes + _segments.Sum(segment => segment.LiveBytes); }
-    }
+    internal long LiveBytes => Interlocked.Read(ref _liveBytes);
 
     internal long MemoryBytes
     {
@@ -171,48 +169,91 @@ internal sealed unsafe class PayloadStore : IDisposable
     internal Handle Save(ReadOnlySpan<byte> bytes)
     {
         var key = new Key(PayloadHash.Compute(bytes), bytes.Length);
+        long waitStart = JournalTelemetry.Now();
         WaitForBacklog();
         lock (_gate)
         {
+            JournalTelemetry.Add(JournalTelemetry.Stage.ArchiveWait, waitStart);
             ObjectDisposedException.ThrowIf(_disposed, this);
-            _byHash.TryGetValue(key, out Handle? existing);
-            if (existing is not null && existing.InMemory && existing.MemorySpan.SequenceEqual(bytes))
-            {
-                existing.References++;
-                return existing;
-            }
-            var handle = new Handle(key, bytes.Length) { References = 1, Registered = existing is null };
-            bool resident = bytes.Length <= MemoryLimit;
-            CheckDiskLimit(resident ? SpilledBytes(MemoryLimit - bytes.Length) : bytes.Length);
-
-            handle.Memory = (nint)NativeMemory.Alloc((nuint)Math.Max(1, bytes.Length));
-            bytes.CopyTo(handle.MemorySpan);
-            if (resident)
-            {
-                while (_memoryBytes > Math.Max(0, MemoryLimit - bytes.Length) && _inMemory.First is { } node)
-                    Spill(node.Value);
-
-                handle.MemoryNode = _inMemory.AddLast(handle);
-                _memoryBytes += bytes.Length;
-            }
-            else
-                Enqueue(handle);
-
-            if (handle.Registered)
-                _byHash.Add(key, handle);
-
-            return handle;
+            if (Share(key, bytes) is Handle shared)
+                return shared;
         }
+
+        nint memory = (nint)NativeMemory.Alloc((nuint)Math.Max(1, bytes.Length));
+        bool adopted = false;
+        try
+        {
+            bytes.CopyTo(new Span<byte>((void*)memory, bytes.Length));
+            waitStart = JournalTelemetry.Now();
+            lock (_gate)
+            {
+                JournalTelemetry.Add(JournalTelemetry.Stage.ArchiveWait, waitStart);
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (Share(key, bytes) is Handle shared)
+                    return shared;
+
+                var handle = new Handle(key, bytes.Length) { References = 1, Registered = !_byHash.ContainsKey(key) };
+                bool resident = bytes.Length <= MemoryLimit;
+                CheckDiskLimit(resident ? SpilledBytes(MemoryLimit - bytes.Length) : bytes.Length);
+
+                handle.Memory = memory;
+                adopted = true;
+                if (resident)
+                {
+                    while (_memoryBytes > Math.Max(0, MemoryLimit - bytes.Length) && _inMemory.First is { } node)
+                        Spill(node.Value);
+
+                    handle.MemoryNode = _inMemory.AddLast(handle);
+                    _memoryBytes += bytes.Length;
+                }
+                else
+                    Enqueue(handle);
+
+                if (handle.Registered)
+                    _byHash.Add(key, handle);
+
+                Interlocked.Add(ref _liveBytes, handle.Length);
+                return handle;
+            }
+        }
+        finally
+        {
+            if (!adopted)
+                NativeMemory.Free((void*)memory);
+        }
+    }
+
+    private Handle? Share(Key key, ReadOnlySpan<byte> bytes)
+    {
+        if (!_byHash.TryGetValue(key, out Handle? existing) || !existing.InMemory || !existing.MemorySpan.SequenceEqual(bytes))
+            return null;
+
+        existing.References++;
+        return existing;
     }
 
     internal void Release(Handle handle)
     {
+        nint freed = 0;
+        try { ReleaseLocked(handle, ref freed); }
+        finally
+        {
+            if (freed != 0)
+                NativeMemory.Free((void*)freed);
+        }
+    }
+
+    private void ReleaseLocked(Handle handle, ref nint freed)
+    {
         Segment? relocate = null;
+        long waitStart = JournalTelemetry.Now();
         lock (_gate)
         {
+            JournalTelemetry.Add(JournalTelemetry.Stage.ArchiveWait, waitStart);
             if (--handle.References > 0)
                 return;
 
+            Interlocked.Add(ref _liveBytes, -handle.Length);
             if (handle.Registered)
                 _byHash.Remove(handle.Key);
 
@@ -222,7 +263,7 @@ internal sealed unsafe class PayloadStore : IDisposable
             if (handle.WritePending)
             {
                 handle.WritePending = false;
-                FreeMemory(handle);
+                freed = TakeMemory(handle);
                 AddPending(-handle.Length);
                 _signal.Set();
                 return;
@@ -232,7 +273,7 @@ internal sealed unsafe class PayloadStore : IDisposable
                 _inMemory.Remove(handle.MemoryNode);
                 handle.MemoryNode = null;
                 _memoryBytes -= handle.Length;
-                FreeMemory(handle);
+                freed = TakeMemory(handle);
                 return;
             }
             if (handle.Segment is not Segment segment)
@@ -399,6 +440,7 @@ internal sealed unsafe class PayloadStore : IDisposable
             }
             catch (Exception ex) { failure = ex; }
 
+            nint written = 0;
             lock (_gate)
             {
                 handle.Writing = false;
@@ -406,7 +448,7 @@ internal sealed unsafe class PayloadStore : IDisposable
                 if (handle.References <= 0)
                 {
                     handle.WritePending = false;
-                    FreeMemory(handle);
+                    written = TakeMemory(handle);
                     AddPending(-handle.Length);
                 }
                 else if (failure is null)
@@ -416,7 +458,7 @@ internal sealed unsafe class PayloadStore : IDisposable
                     handle.Offset = offset;
                     segment.Handles.Add(handle);
                     segment.LiveBytes += handle.Length;
-                    FreeMemory(handle);
+                    written = TakeMemory(handle);
                     AddPending(-handle.Length);
                 }
                 else
@@ -424,6 +466,8 @@ internal sealed unsafe class PayloadStore : IDisposable
 
                 CloseIfEmpty(segment);
             }
+            if (written != 0)
+                NativeMemory.Free((void*)written);
         }
         if (failure is not null)
         {
@@ -554,6 +598,13 @@ internal sealed unsafe class PayloadStore : IDisposable
         return true;
     }
 
+    private static nint TakeMemory(Handle handle)
+    {
+        nint memory = handle.Memory;
+        handle.Memory = 0;
+        return memory;
+    }
+
     private static void FreeMemory(Handle handle)
     {
         NativeMemory.Free((void*)handle.Memory);
@@ -629,6 +680,7 @@ internal sealed unsafe class PayloadStore : IDisposable
             _pending.Clear();
             _memoryBytes = 0;
             Interlocked.Exchange(ref _pendingBytes, 0);
+            Interlocked.Exchange(ref _liveBytes, 0);
             foreach (Segment segment in _segments)
                 segment.File.Dispose();
 

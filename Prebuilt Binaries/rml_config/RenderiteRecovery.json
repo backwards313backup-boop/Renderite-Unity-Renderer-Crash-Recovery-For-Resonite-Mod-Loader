@@ -1,17 +1,19 @@
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "values": {
-    "recovery_attempts": 10,
-    "stable_seconds": 120,
-    "journal_limit_mb": 0,
-    "journal_entry_limit": 0,
-    "archive_disk_limit_mb": 0,
-    "archive_directory": "",
-    "archive_memory_mb": 2048,
-    "compaction_threshold_mb": 512,
-    "show_dash_panel": true,
-    "write_log_files": true,
-    "asset_quarantine": true,
-    "exit_when_recovery_fails": true
+    "recovery_attempts": 10, // How many Tries before recovery of renderite gives up.
+    "stable_seconds": 120, // Seconds before the recovery attempt count resets.
+    "journal_limit_mb": 0, // Max journal size in MB. 0=no limit.
+    "journal_entry_limit": 0, // Max saved commands. 0=no limit.
+    "archive_disk_limit_mb": 0, // Max disk use in MB. 0=no limit.
+    "archive_directory": "", // Path for saved to disk cache. Empty=the temp directory folder.
+    "archive_memory_mb": 4096, // RAM for payloads before they spill to disk.
+    "compaction_threshold_mb": 512, // Reclaim disk space after this many MB of old cache data builds up.
+    "show_dash_panel": true, // Show Recovery Dashboard item.
+    "show_force_exit_button": true, // Show Force Exit on the Exit screen.
+    "write_log_files": true, // Enables logging files. 
+    "asset_quarantine": true, // Nullify assets that crash the renderer. Prevents from restoring an item that crashes the renderer again when restarted.
+    "exit_when_recovery_fails": true, // Exit Resonite's main engine process if recovery gives up.
+    "journal_telemetry": false // Collect detailed journal telementry stats.
   }
 }

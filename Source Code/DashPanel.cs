@@ -21,6 +21,8 @@ internal static class DashPanel
     private static Text? _left;
     private static Text? _right;
     private static Text? _footer;
+    private static Text? _telemetryText;
+    private static Text? _contentLogText;
     private static long _nextUpdate;
     private static int _queued;
     private static int _failures;
@@ -144,7 +146,7 @@ internal static class DashPanel
         ui.PushStyle();
         Slot corner = ui.Next("Info");
         RectTransform rect = corner.GetComponent<RectTransform>();
-        rect.AnchorMin.Value = new float2(0.55f, 1f);
+        rect.AnchorMin.Value = new float2(0.45f, 1f);
         rect.AnchorMax.Value = new float2(1f, 1f);
         rect.OffsetMin.Value = new float2(0f, -TitleBandHeight);
         rect.OffsetMax.Value = float2.Zero;
@@ -152,7 +154,22 @@ internal static class DashPanel
         ui.VerticalLayout(8f, 0f, Alignment.TopRight, false, false);
 
         ui.Style.MinHeight = 48f;
+        ui.Style.MinWidth = -1f;
+        ui.Style.PreferredWidth = -1f;
+        ui.Style.FlexibleWidth = -1f;
+        Slot top = ui.Next("Buttons");
+        Row(top, 12f, 0f);
+        ui.NestInto(top);
+        ui.PushStyle();
+        _contentLogText = TextButton(ui, "Write Journal Content Log", ContentLogButtonWidth, ContentLogLabel, WriteContentLog);
+        _telemetryText = TextButton(ui, "Telemetry", TelemetryButtonWidth, TelemetryLabel(), () =>
+        {
+            Settings.SetJournalTelemetry(!JournalTelemetry.Enabled);
+            UpdateTelemetryLabel();
+        });
+        ui.PopStyle();
         BuildCredit(ui);
+        ui.NestOut();
 
         ui.Style.MinWidth = -1f;
         ui.Style.PreferredWidth = -1f;
@@ -169,6 +186,101 @@ internal static class DashPanel
         ui.NestOut();
         ui.NestOut();
         ui.PopStyle();
+    }
+
+    private const float TelemetryButtonWidth = 290f;
+    private const float ContentLogButtonWidth = 250f;
+    private const float TextButtonHeight = 55f;
+    private const string ContentLogLabel = "<nobr>Write Journal Content Log</nobr>";
+    private const float ContentLogMessageSeconds = 4f;
+
+    private static void WriteContentLog()
+    {
+        World? world = _contentLogText?.World;
+        bool started;
+        try
+        {
+            started = JournalContentLog.Write(result => world?.RunSynchronously(() =>
+            {
+                SetContentLogLabel(result.Success ? $"<nobr>Saved {result.Entries:N0} entries</nobr>" : "<nobr>Failed, see the log</nobr>");
+                world.RunInSeconds(ContentLogMessageSeconds, () => SetContentLogLabel(ContentLogLabel));
+            }));
+        }
+        catch (Exception ex)
+        {
+            RenderiteRecoveryMod.Warn($"Could not write the journal content log: {ex.Message}");
+            SetContentLogLabel("<nobr>Failed, see the log</nobr>");
+            world?.RunInSeconds(ContentLogMessageSeconds, () => SetContentLogLabel(ContentLogLabel));
+            return;
+        }
+        if (started)
+            SetContentLogLabel("<nobr>Writing...</nobr>");
+    }
+
+    private static void SetContentLogLabel(string label)
+    {
+        if (_contentLogText is { IsDestroyed: false } text)
+            text.Content.Value = label;
+    }
+
+    private static Text TextButton(UIBuilder ui, string name, float width, string content, Action pressed)
+    {
+        ui.Style.MinWidth = width;
+        ui.Style.PreferredWidth = width;
+        ui.Style.FlexibleWidth = -1f;
+        ui.Style.MinHeight = TextButtonHeight;
+        ui.Style.PreferredHeight = TextButtonHeight;
+        ui.Style.FlexibleHeight = -1f;
+        Slot slot = ui.Next(name);
+        Image background = slot.AttachComponent<Image>();
+        background.Tint.Value = colorX.Clear;
+        Button button = slot.AttachComponent<Button>();
+        InteractionElement.ColorDriver hover = button.ColorDrivers.Count > 0 ? button.ColorDrivers[0] : button.ColorDrivers.Add();
+        if (!hover.ColorDrive.IsLinkValid)
+            hover.ColorDrive.Target = background.Tint;
+
+        hover.TintColorMode.Value = InteractionElement.ColorMode.Direct;
+        hover.NormalColor.Value = colorX.Clear;
+        hover.HighlightColor.Value = RadiantUI_Constants.Hero.CYAN.SetA(0.45f);
+        hover.PressColor.Value = RadiantUI_Constants.Hero.CYAN.SetA(0.7f);
+        hover.DisabledColor.Value = colorX.Clear;
+        button.LocalPressed += (_, _) => pressed();
+
+        ui.NestInto(slot);
+        Text label = ui.Text(content, 22f, true, Alignment.MiddleCenter, true);
+        label.AutoSizeMin.Value = 12f;
+        label.AutoSizeMax.Value = 22f;
+        label.Color.Value = colorX.White;
+        RectTransform labelRect = label.Slot.GetComponent<RectTransform>();
+        labelRect.AnchorMin.Value = float2.Zero;
+        labelRect.AnchorMax.Value = float2.One;
+        labelRect.OffsetMin.Value = new float2(10f, 4f);
+        labelRect.OffsetMax.Value = new float2(-10f, -4f);
+        ui.NestOut();
+        return label;
+    }
+
+    private static string TelemetryLabel() => JournalTelemetry.Enabled
+        ? "<nobr>Journal telemetry: ON</nobr>"
+        : "<nobr>Journal telemetry: OFF</nobr>";
+
+    private static void UpdateTelemetryLabel()
+    {
+        if (_telemetryText is { IsDestroyed: false } text && text.Content.Value != TelemetryLabel())
+            text.Content.Value = TelemetryLabel();
+    }
+
+    private static void Row(Slot slot, float spacing, float padding)
+    {
+        HorizontalLayout row = slot.AttachComponent<HorizontalLayout>();
+        row.Spacing.Value = spacing;
+        row.PaddingTop.Value = padding;
+        row.PaddingRight.Value = padding;
+        row.PaddingBottom.Value = padding;
+        row.PaddingLeft.Value = padding;
+        row.ChildAlignment = Alignment.MiddleRight;
+        row.ForceExpandWidth.Value = false;
+        row.ForceExpandHeight.Value = false;
     }
 
     private static void BuildCredit(UIBuilder ui)
@@ -189,9 +301,6 @@ internal static class DashPanel
         hover.HighlightColor.Value = new colorX(1f, 1f, 1f, 0.15f);
         hover.PressColor.Value = new colorX(1f, 1f, 1f, 0.3f);
         hover.DisabledColor.Value = colorX.Clear;
-        _creditButton = button;
-        _creditHoverLogs = 0;
-        button.IsHovering.OnValueChange += _ => button.World.RunInUpdates(3, () => LogCredit("hover"));
         credit.AttachComponent<ContactLink>().UserId.Value = CreatorUserId;
         _creatorInfo = credit.AttachComponent<CloudUserInfo>();
         _creatorInfo.UserId.Value = CreatorUserId;
@@ -228,19 +337,6 @@ internal static class DashPanel
 
         ui.NestOut();
 
-        static void Row(Slot slot, float spacing, float padding)
-        {
-            HorizontalLayout row = slot.AttachComponent<HorizontalLayout>();
-            row.Spacing.Value = spacing;
-            row.PaddingTop.Value = padding;
-            row.PaddingRight.Value = padding;
-            row.PaddingBottom.Value = padding;
-            row.PaddingLeft.Value = padding;
-            row.ChildAlignment = Alignment.MiddleRight;
-            row.ForceExpandWidth.Value = false;
-            row.ForceExpandHeight.Value = false;
-        }
-
         void CreditWord(string content, Alignment alignment)
         {
             Text word = ui.Text(content, 22f, true, alignment, true);
@@ -255,23 +351,6 @@ internal static class DashPanel
     private const string CreatorUserId = "U-backwards";
     private const string CreatorNameColor = "#FFD700";
     private static readonly Uri CreatorIconFallback = new("resdb:///2bfe4c3df1589cc656ae78880f44bbb5dc260ded4a4c5e2fa75bce64a863b088.webp");
-    private static Button? _creditButton;
-    private static int _creditHoverLogs;
-
-    private static void LogCredit(string reason)
-    {
-        if (_creditButton is not { IsDestroyed: false } button || _creditHoverLogs >= 6)
-            return;
-
-        _creditHoverLogs++;
-        string rects = string.Join(", ", new[] { button.Slot }.Concat(button.Slot.Children).Concat(button.Slot.Children.SelectMany(child => child.Children))
-            .Select(slot => slot.GetComponent<RectTransform>() is RectTransform rect ? $"{slot.Name} {rect.LocalComputeRect.width:F0}x{rect.LocalComputeRect.height:F0}" : null)
-            .Where(entry => entry is not null));
-        string drivers = string.Join(", ", button.ColorDrivers.Select(driver => $"{driver.TintColorMode.Value} valid={driver.ColorDrive.IsLinkValid} highlight={driver.HighlightColor.Value}"));
-        colorX tint = button.Slot.GetComponent<Image>()?.Tint.Value ?? colorX.Clear;
-        RenderiteRecoveryMod.Msg($"Credit {reason}: hovering={button.IsHovering.Value}, pressed={button.IsPressed.Value}, tint={tint}, drivers [{drivers}], rects [{rects}]");
-    }
-
     private static CloudUserInfo? _creatorInfo;
     private static StaticTexture2D? _creatorIcon;
 
@@ -318,7 +397,9 @@ internal static class DashPanel
             _right.Content.Value = RightColumn(status, report);
 
         if (_footer is not null)
-            _footer.Content.Value = $"Settings: {Settings.FilePath}. Version {RenderiteRecoveryMod.ModVersion}.";
+            _footer.Content.Value = $"Settings: {Settings.FilePath}.\nVersion {RenderiteRecoveryMod.ModVersion}.";
+
+        UpdateTelemetryLabel();
     }
 
     private static string LeftColumn(RecoveryCoordinator.StatusReport status, ResourceMetrics.Report? report)
@@ -326,11 +407,9 @@ internal static class DashPanel
         var text = new StringBuilder();
         Heading(text, "Recovery");
         text.AppendLine($"Recoveries this session: {status.Recoveries}");
-        text.AppendLine($"Attempts used: {status.AttemptsUsed} of {Settings.RecoveryAttempts} (all back after {RenderiteRecoveryMod.Seconds(Settings.StableSeconds)} without a failure)");
+        text.AppendLine($"Attempts used: {status.AttemptsUsed} of {Settings.RecoveryAttempts} (reset after {RenderiteRecoveryMod.Seconds(Settings.StableSeconds)} without a failure)");
         if (status.LastRecoveryLocal is DateTime last)
-        {
             text.AppendLine($"Last: {last.ToString("T", CultureInfo.CurrentCulture)}, took {status.LastRecoveryMs / 1000.0:F1} seconds, {status.LastRecoveryCommands:N0} commands");
-        }
         else
             text.AppendLine("Last: none yet");
 
@@ -391,12 +470,16 @@ internal static class DashPanel
             text.AppendLine($"  {Bytes(last.HeapBeforeBytes)} -> {Bytes(last.HeapAfterBytes)}: {Bytes(Math.Max(0, last.HeapBeforeBytes - last.HeapAfterBytes))} freed, {Bytes(last.PromotedBytes)} promoted");
             long[] g = last.GenerationAfterBytes;
             if (g.Length >= 5)
-                text.AppendLine($"  heap after: gen 0 {Bytes(g[0])}, gen 1 {Bytes(g[1])}, gen 2 {Bytes(g[2])}, large {Bytes(g[3])}, pinned {Bytes(g[4])}, fragmented {Bytes(last.FragmentedBytes)}");
+            {
+                text.AppendLine($"  heap after: gen 0 {Bytes(g[0])}, gen 1 {Bytes(g[1])}, gen 2 {Bytes(g[2])}");
+                text.AppendLine($"  large {Bytes(g[3])}, pinned {Bytes(g[4])}, fragmented {Bytes(last.FragmentedBytes)}");
+            }
         }
         long modAllocated = ResourceMetrics.TotalAllocatedBytes;
         long modHeld = status.JournalMemoryBytes + status.ArchiveMemoryBytes + status.DeferredBytes;
         double share = gc.AllocatedBytes > 0 ? modAllocated * 100.0 / gc.AllocatedBytes : 0;
-        text.AppendLine($"This mod: allocated {Bytes(modAllocated)} ({Percent(share)} of Resonite's), about {Bytes(Math.Max(0, modAllocated - modHeld))} became garbage, {Bytes(modHeld)} still held");
+        text.AppendLine($"This mod: allocated {Bytes(modAllocated)} ({Percent(share)} of Resonite's)");
+        text.AppendLine($"about {Bytes(Math.Max(0, modAllocated - modHeld))} became garbage, {Bytes(modHeld)} still held");
     }
 
     private static string RightColumn(RecoveryCoordinator.StatusReport status, ResourceMetrics.Report? report)
@@ -408,18 +491,22 @@ internal static class DashPanel
             text.AppendLine("Measuring...");
         else
         {
-            text.AppendLine($"{Percent(report.CpuPercentOfCore)} of one core over the last {report.WindowSeconds:F0} seconds");
-            text.AppendLine($"{report.HookMsPerFrame:F3} ms of hook time per engine frame");
-            text.AppendLine($"{Percent(report.ShareOfProcessCpuPercent)} of Resonite's CPU time");
-            foreach (ResourceMetrics.AreaUsage area in report.Areas)
-                text.AppendLine($"  {AreaName(area.Area)}: {Percent(area.CpuPercentOfCore)}, total {area.TotalCpuSeconds:F1} seconds");
+            string estimated = report.CpuMeasured ? "" : " (estimated)";
+            text.AppendLine($"This mod: {Percent(report.ShareOfProcessPercent)} of Resonite's CPU time{estimated}, last {RenderiteRecoveryMod.Seconds((long)Math.Round(report.WindowSeconds))}");
+            text.AppendLine($"  {Percent(report.ShareOfMachinePercent)} of the whole CPU ({report.LogicalProcessors} threads), Resonite uses {Percent(report.ProcessShareOfMachinePercent)}");
+            text.AppendLine($"Frame cost: {report.EngineMsPerFrame:F3} ms per frame on the engine thread");
+            if (report.CpuMeasured)
+                text.AppendLine($"Threads waiting inside the mod: {report.WaitingThreads:F2} on average");
 
-            text.AppendLine($"Total since start: {report.TotalCpuSeconds:F1} seconds");
+            foreach (ResourceMetrics.AreaUsage area in report.Areas.Where(area => area.Area != ResourceMetrics.Area.Telemetry))
+                text.AppendLine($"  {AreaName(area.Area)}: {Percent(area.ShareOfProcessPercent)}, total {area.TotalCpuSeconds:F1} seconds");
+
+            text.AppendLine($"Total CPU time since start: {report.TotalCpuSeconds:F1} seconds{estimated}");
         }
         text.AppendLine();
 
         Heading(text, "Memory");
-        text.AppendLine($"Journal (RAM): {Bytes(status.JournalMemoryBytes)} in {status.JournalEntries:N0} entries");
+        text.AppendLine($"Journal commands (RAM): {Bytes(status.JournalMemoryBytes)} in {status.JournalEntries:N0} entries");
         if (report is not null)
             text.AppendLine($"Allocations: {Bytes((long)report.AllocatedBytesPerSecond)} per second (reclaimed by the Garbage Collector)");
 
@@ -435,6 +522,8 @@ internal static class DashPanel
 
         if (waitingForDisk > 0)
             text.AppendLine($"Payloads waiting for the disk: {Bytes(waitingForDisk)}");
+
+        text.AppendLine($"Total held in RAM: {Bytes(status.JournalMemoryBytes + status.ArchiveMemoryBytes + status.DeferredBytes)}");
 
         string journalLimit = CommandJournal.ByteLimit > 0 ? Bytes(CommandJournal.ByteLimit) : "none";
         text.AppendLine($"Journal limit: {journalLimit}");
@@ -457,13 +546,17 @@ internal static class DashPanel
             text.AppendLine();
             return;
         }
+
         text.AppendLine($"{size.WorldName}: {Bytes(size.TotalBytes)}");
-        text.AppendLine($"  Textures: {Bytes(size.Textures.Bytes)} ({size.Textures.Count:N0})");
+        
         if (size.TexturesOnly)
+        {
+            text.AppendLine($"  Textures: {Bytes(size.Textures.Bytes)} ({size.Textures.Count:N0})");
             text.AppendLine("  Meshes and other buffers: not counted while the journal is off");
+        }
         else
         {
-            text.AppendLine($"  Meshes: {Bytes(size.Meshes.Bytes)} ({size.Meshes.Count:N0})");
+            text.AppendLine($"  Textures: {Bytes(size.Textures.Bytes)} ({size.Textures.Count:N0}), Meshes: {Bytes(size.Meshes.Bytes)} ({size.Meshes.Count:N0})");
             text.AppendLine($"  Other GPU buffers: {Bytes(size.Other.Bytes)} ({size.Other.Count:N0})");
         }
         text.AppendLine();

@@ -11,16 +11,46 @@ internal static class ExitScreenButton
     private const string SlotName = "RenderiteRecovery.ForceExit";
     private const string Label = "Force Exit Resonite (Renderite Recovery)";
 
+    private static ExitScreen? _screen;
+
     private static void Postfix(ExitScreen __instance)
+    {
+        if (__instance.World != Userspace.UserspaceWorld)
+            return;
+
+        _screen = __instance;
+        Sync(__instance);
+    }
+
+    internal static void Refresh()
+    {
+        ExitScreen? screen = _screen;
+        World? world = screen?.World;
+        if (screen is null || world is null || world.IsDestroyed)
+            return;
+
+        world.RunSynchronously(() => Sync(screen));
+    }
+
+    private static void Sync(ExitScreen screen)
     {
         try
         {
-            if (__instance.World != Userspace.UserspaceWorld)
+            if (screen.IsDestroyed)
                 return;
 
-            Canvas? canvas = AccessTools.Property(typeof(RadiantDashScreen), "ScreenCanvas").GetValue(__instance) as Canvas;
+            Canvas? canvas = AccessTools.Property(typeof(RadiantDashScreen), "ScreenCanvas").GetValue(screen) as Canvas;
             GridLayout? grid = canvas?.Slot.GetComponentInChildren<GridLayout>();
-            if (grid is null || grid.Slot.Children.Any(child => child.Name == SlotName))
+            if (grid is null)
+                return;
+
+            Slot? existing = grid.Slot.Children.FirstOrDefault(child => child.Name == SlotName);
+            if (!Settings.ShowForceExitButton)
+            {
+                existing?.Destroy();
+                return;
+            }
+            if (existing is not null)
                 return;
 
             var ui = new UIBuilder(grid.Slot);
@@ -28,12 +58,12 @@ internal static class ExitScreenButton
             Button button = AddButton(ui, OfficialAssets.Graphics.Icons.Dash.CloseWorld, Label);
             button.Slot.Name = SlotName;
             button.Slot.PersistentSelf = false;
-            Engine engine = __instance.Engine;
+            Engine engine = screen.Engine;
             button.LocalPressed += (_, _) => ForceExit.Run(engine);
         }
         catch (Exception ex)
         {
-            RenderiteRecoveryMod.Warn($"Could not add the force exit button: {ex}");
+            RenderiteRecoveryMod.Warn($"Could not update the force exit button: {ex}");
         }
     }
 

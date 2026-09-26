@@ -5,7 +5,7 @@ namespace RenderiteRecovery;
 
 public sealed class RenderiteRecoveryMod : ResoniteMod
 {
-    internal const string ModVersion = "1.0.0";
+    internal const string ModVersion = "2.0.0";
 
     public override string Name => "Renderite Recovery";
     public override string Author => "backwards";
@@ -46,6 +46,7 @@ public sealed class RenderiteRecoveryMod : ResoniteMod
     public override void OnEngineInit()
     {
         GarbageCollection.Start();
+        ThreadCpu.Start();
         Settings.Initialize(GetConfiguration(), this);
         Compatibility.Result compatibility = Compatibility.Check();
         if (!compatibility.CanRun)

@@ -23,7 +23,7 @@ internal static class RendererDiagnostics
             path = Path.Combine(directory, $"{LogPrefix}{DateTime.Now:yyyy-MM-dd HH_mm_ss}-attempt{attempt}.log");
             Prune(directory);
         }
-        Volatile.Write(ref _current, new Launch(path, DateTime.UtcNow, $"replacement renderer (attempt {attempt})"));
+        Volatile.Write(ref _current, new Launch(path, DateTime.UtcNow, $"renderer started by recovery attempt {attempt}"));
         Volatile.Write(ref _reported, 0);
         return path;
     }

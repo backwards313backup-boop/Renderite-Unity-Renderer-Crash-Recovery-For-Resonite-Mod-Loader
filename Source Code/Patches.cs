@@ -22,7 +22,7 @@ internal static class RendererWatchdogPatch
         if (Target() is not null)
             return true;
 
-        RenderiteRecoveryMod.Warn("Could not find the engine's renderer watchdog loop; it will still try to shut Resonite down when a renderer dies.");
+        RenderiteRecoveryMod.Warn("Could not find the engine's renderer watchdog loop. It will still try to shut Resonite down when a renderer dies.");
         return false;
     }
 
@@ -65,12 +65,88 @@ internal static class RendererWatchdogPatch
     }
 }
 
+[HarmonyPatch]
+internal static class MeshBufferFreePatch
+{
+    private static readonly MethodInfo? FreeMeshBuffer = AccessTools.Method(typeof(Mesh), "FreeMeshBuffer");
+    private static readonly FieldInfo? MeshBufferField = AccessTools.Field(typeof(Mesh), "meshBuffer");
+    private static readonly Lazy<(MethodInfo Method, FieldInfo Owner)?> Found = new(Find);
+    private static int _failures;
+
+    internal static bool Active { get; private set; }
+
+    internal static MeshBuffer? BufferOf(Mesh mesh) => MeshBufferField?.GetValue(mesh) as MeshBuffer;
+
+    private static (MethodInfo Method, FieldInfo Owner)? Find()
+    {
+        if (FreeMeshBuffer is null || MeshBufferField is null)
+            return null;
+
+        var callers = new List<MethodInfo>();
+        foreach (Type nested in typeof(Mesh).GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic))
+        {
+            foreach (MethodInfo method in nested.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public
+                | BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+            {
+                try
+                {
+                    if (PatchProcessor.ReadMethodBody(method).Any(pair => Equals(pair.Value, FreeMeshBuffer)))
+                        callers.Add(method);
+                }
+                catch (Exception) { }
+            }
+        }
+        if (callers.Count != 1 || callers[0].IsStatic)
+            return null;
+
+        FieldInfo? owner = callers[0].DeclaringType!.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .SingleOrDefault(field => field.FieldType == typeof(Mesh));
+        return owner is null ? null : (callers[0], owner);
+    }
+
+    private static bool Prepare()
+    {
+        if (Found.Value is not null)
+            return true;
+
+        RenderiteRecoveryMod.Warn("Could not find where the engine frees a loaded mesh's shared memory, so mesh data is copied into the journal when it is sent.");
+        return false;
+    }
+
+    private static MethodBase TargetMethod()
+    {
+        Active = true;
+        return Found.Value!.Value.Method;
+    }
+
+    private static void Prefix(object __instance)
+    {
+        try
+        {
+            if (Found.Value?.Owner.GetValue(__instance) is Mesh mesh)
+                RecoveryCoordinator.MeshBufferFreeing(mesh);
+        }
+        catch (Exception ex)
+        {
+            if (Interlocked.Increment(ref _failures) <= 5)
+                RenderiteRecoveryMod.Warn($"Could not save a mesh before the engine freed it: {ex.Message}");
+        }
+    }
+}
+
 [HarmonyPatch(typeof(RenderiteMessagingHost), nameof(RenderiteMessagingHost.SendCommand))]
 internal static class SendCommandPatch
 {
     private static bool Prefix(RendererCommand command, bool isBackground)
     {
-        using var measure = ResourceMetrics.Measure(ResourceMetrics.Area.Recording);
+        JournalTelemetry.Probe probe = JournalTelemetry.Begin();
+        try { return Send(command, isBackground); }
+        finally { JournalTelemetry.End(probe, command); }
+    }
+
+    private static bool Send(RendererCommand command, bool isBackground)
+    {
+        using var measure = ResourceMetrics.MeasureCommand(ResourceMetrics.Area.Recording);
         if (RecoveryCoordinator.BlockQuarantined(command))
             return false;
 
@@ -108,6 +184,7 @@ internal static class WaitForFramePatch
             TestCrashHotkey.Poll(__instance);
         }
         DashPanel.Poll();
+        JournalTelemetry.Poll();
         if (!RecoveryCoordinator.RenderingSuspended)
             return true;
 

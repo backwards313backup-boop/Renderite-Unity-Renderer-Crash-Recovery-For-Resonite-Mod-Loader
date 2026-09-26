@@ -9,11 +9,11 @@ namespace RenderiteRecovery;
 internal static class Settings
 {
     internal static readonly ModConfigurationKey<int> RecoveryAttemptsKey = new("recovery_attempts",
-        "How many recovery attempts are allowed before giving up (see exit_when_recovery_fails). Every attempt counts: a replacement renderer that fails, and a renderer that fails again soon after a recovery. The count starts over once the renderer has run for stable_seconds after a recovery. An attempt that finds the asset crashing the renderer does not count. Minimum 1.",
+        "How many recovery attempts are allowed before giving up. Every attempt counts a replacement renderer that fails, and a renderer that fails again soon after a recovery. The count starts over once the renderer has run for stable_seconds after a recovery. An attempt that finds the asset crashing the renderer does not count. Minimum 1.",
         () => 10, valueValidator: value => value >= 1);
 
     internal static readonly ModConfigurationKey<int> StableSecondsKey = new("stable_seconds",
-        "How long, in seconds, the renderer has to run after a recovery before its next failure gets all recovery_attempts again. Replaces crash_loop_window_seconds (crash_loop_limit is gone: recovery_attempts covers crash loops). Minimum 1.",
+        "How long, in seconds, the renderer has to run after a recovery before its next failure recovery_attempts resets.",
         () => 120, valueValidator: value => value >= 1);
 
     internal static readonly ModConfigurationKey<long> JournalLimitMbKey = new("journal_limit_mb",
@@ -33,19 +33,23 @@ internal static class Settings
         () => "");
 
     internal static readonly ModConfigurationKey<long> ArchiveMemoryMbKey = new("archive_memory_mb",
-        "Payload data, in MB, kept in RAM before the archive starts using disk. Past it, the oldest payloads move to disk, so recently changed (and most often replaced) data stays in RAM. 0 = everything goes to disk.",
-        () => 0, valueValidator: value => value >= 0);
+        "Payload data, in MB, kept in RAM before the archive starts using disk. Past it, the oldest payloads move to disk, so recently changed (and most often replaced) data stays in RAM. RAM is only used as the journal fills, up to this amount. 0 = everything goes to disk, which can stall asset loading on a slow drive.",
+        () => 4096, valueValidator: value => value >= 0);
 
     internal static readonly ModConfigurationKey<long> CompactionThresholdMbKey = new("compaction_threshold_mb",
-        "Dead space in the payload archive, in MB, that starts proactive compaction (when it is also more than half the live data). Lower keeps the archive smaller on disk at the cost of more background copying. Minimum 1.",
+        "When abandoned assets in the cache equalto this value in MB are unusued on the disk, start compaction which removes these dead assets to reduce cache file size on disk.",
         () => 512, valueValidator: value => value >= 1);
 
     internal static readonly ModConfigurationKey<bool> ShowDashPanelKey = new("show_dash_panel",
         "Show the Renderite Recovery screen (status and resource use) on the dash, next to Exit.",
         () => true);
 
+    internal static readonly ModConfigurationKey<bool> ShowForceExitButtonKey = new("show_force_exit_button",
+        "Show the \"Force Exit Resonite (Renderite Recovery)\" button on the dash Exit screen. It closes the renderer and ends Resonite at once, without saving or syncing, for when a normal exit hangs.",
+        () => true);
+
     internal static readonly ModConfigurationKey<bool> WriteLogFilesKey = new("write_log_files",
-        "Write the mod's own log files: Logs/RenderiteRecovery.Host.log, a log for each replacement renderer (Logs/RenderiteRecovery.Renderer-<time>-attempt<N>.log, the newest 20 are kept) and copies of Unity crash dumps (Logs/RenderiteRecovery.Crashes). false = none of these are written, replacement renderers write no log at all, and a crash report cannot quote their exception. The mod's messages still appear in Resonite's own log. Replaces write_renderer_logs.",
+        "Write the mod's log files: Logs/RenderiteRecovery.Host.log, a log for each replacement renderer (Logs/RenderiteRecovery.Renderer-<time>-attempt<N>.log) and copies of Unity crash dumps (Logs/RenderiteRecovery.Crashes).",
         () => true);
 
     private static readonly (string Old, ModConfigurationKey New)[] RenamedKeys =
@@ -55,19 +59,23 @@ internal static class Settings
     ];
 
     internal static readonly ModConfigurationKey<bool> AssetQuarantineKey = new("asset_quarantine",
-        "When the renderer fails, the assets it was loading become suspects (not after the test hotkey, and not the particle, trail and video updates the engine sends every frame). The next recovery attempt loads each suspect on its own after everything else, and one that crashes the replacement renderer is quarantined: it is left out of later recoveries and stays blank or invisible until the engine unloads it. Finding one gives recovery an extra attempt, even past recovery_attempts. false = replay everything every time. Assets that are already quarantined stay quarantined either way, because the renderer does not have them.",
+        "When the renderer crashes, the assets it was loading become suspects. The next recovery attempt loads each suspect on its own after everything else and one that crashes the replacement renderer is quarantined.",
         () => true);
 
     internal static readonly ModConfigurationKey<bool> ExitWhenRecoveryFailsKey = new("exit_when_recovery_fails",
-        "What happens when recovery gives up (recovery_attempts used up, or recovery disabled mid-way). true = Resonite exits normally, as if its window had been closed (it saves and syncs; if that takes more than 2 minutes it is terminated). false = the engine and your sessions keep running with no renderer window, for example to keep a hosted world up for guests; end Resonite from Task Manager when you are done.",
+        "If recovery fails all of its attempts to recover, we can keep the main engine running without exiting.",
         () => true);
+
+    internal static readonly ModConfigurationKey<bool> JournalTelemetryKey = new("journal_telemetry",
+        "Collects journal telemetry of what the recovery journal holds. The report is rewritten every 10 seconds in Logs/RenderiteRecovery.JournalTelemetry.txt. This costs some CPU while it is enabled, so leave it off unless you want to check performance stats.",
+        () => false);
 
     internal static readonly ModConfigurationKey[] Keys =
     [
         RecoveryAttemptsKey, StableSecondsKey, JournalLimitMbKey,
         JournalEntryLimitKey, ArchiveDiskLimitMbKey, ArchiveDirectoryKey, ArchiveMemoryMbKey,
-        CompactionThresholdMbKey, ShowDashPanelKey, WriteLogFilesKey, AssetQuarantineKey,
-        ExitWhenRecoveryFailsKey
+        CompactionThresholdMbKey, ShowDashPanelKey, ShowForceExitButtonKey, WriteLogFilesKey, AssetQuarantineKey,
+        ExitWhenRecoveryFailsKey, JournalTelemetryKey
     ];
 
     private const long Megabyte = 1024L * 1024;
@@ -79,6 +87,7 @@ internal static class Settings
     internal static volatile int RecoveryAttempts = 10;
     internal static volatile int StableSeconds = 120;
     internal static volatile bool ShowDashPanel = true;
+    internal static volatile bool ShowForceExitButton = true;
     internal static volatile bool WriteLogFiles = true;
     internal static volatile bool QuarantineAssets = true;
     internal static volatile bool ExitWhenRecoveryFails = true;
@@ -123,7 +132,7 @@ internal static class Settings
         RenderiteRecoveryMod.Msg($"Settings ({FilePath}): {Describe()}.");
     }
 
-    internal static string Describe() => $"recovery_attempts={RecoveryAttempts}, stable_seconds={StableSeconds}, journal_limit_mb={CommandJournal.ByteLimit / Megabyte}, journal_entry_limit={CommandJournal.EntryLimit}, archive_disk_limit_mb={PayloadArchiver.DiskLimit / Megabyte}, archive_directory=\"{Get(ArchiveDirectoryKey)}\" ({PayloadArchiver.Directory}), archive_memory_mb={PayloadArchiver.MemoryLimit / Megabyte}, compaction_threshold_mb={PayloadArchiver.CompactionThreshold / Megabyte}, show_dash_panel={ShowDashPanel}, write_log_files={WriteLogFiles}, asset_quarantine={QuarantineAssets}, exit_when_recovery_fails={ExitWhenRecoveryFails}";
+    internal static string Describe() => $"recovery_attempts={RecoveryAttempts}, stable_seconds={StableSeconds}, journal_limit_mb={CommandJournal.ByteLimit / Megabyte}, journal_entry_limit={CommandJournal.EntryLimit}, archive_disk_limit_mb={PayloadArchiver.DiskLimit / Megabyte}, archive_directory=\"{Get(ArchiveDirectoryKey)}\" ({PayloadArchiver.Directory}), archive_memory_mb={PayloadArchiver.MemoryLimit / Megabyte}, compaction_threshold_mb={PayloadArchiver.CompactionThreshold / Megabyte}, show_dash_panel={ShowDashPanel}, show_force_exit_button={ShowForceExitButton}, write_log_files={WriteLogFiles}, asset_quarantine={QuarantineAssets}, exit_when_recovery_fails={ExitWhenRecoveryFails}, journal_telemetry={JournalTelemetry.Enabled}";
 
     private static T Get<T>(ModConfigurationKey<T> key)
     {
@@ -146,8 +155,28 @@ internal static class Settings
             Math.Max(0, Get(ArchiveMemoryMbKey)) * Megabyte,
             ResolveDirectory(Get(ArchiveDirectoryKey)));
         ShowDashPanel = Get(ShowDashPanelKey);
+        bool showForceExit = Get(ShowForceExitButtonKey);
+        if (showForceExit != ShowForceExitButton)
+        {
+            ShowForceExitButton = showForceExit;
+            ExitScreenButton.Refresh();
+        }
         QuarantineAssets = Get(AssetQuarantineKey);
         ExitWhenRecoveryFails = Get(ExitWhenRecoveryFailsKey);
+        JournalTelemetry.SetEnabled(Get(JournalTelemetryKey));
+    }
+
+    internal static void SetJournalTelemetry(bool enabled)
+    {
+        ModConfiguration? config = _config;
+        if (config is null)
+        {
+            JournalTelemetry.SetEnabled(enabled);
+            return;
+        }
+        config.Set(JournalTelemetryKey, enabled, "dash button");
+        try { config.Save(saveDefaultValues: true); }
+        catch (Exception ex) { RenderiteRecoveryMod.Warn($"Could not save journal_telemetry to the settings file: {ex.Message}"); }
     }
 
     private static void MigrateRenamedKeys(ModConfiguration config)
