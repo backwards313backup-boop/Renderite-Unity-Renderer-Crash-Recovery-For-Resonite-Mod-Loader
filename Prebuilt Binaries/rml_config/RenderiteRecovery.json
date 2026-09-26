@@ -1,5 +1,5 @@
 {
-  "version": "2.0.0",
+  "version": "2.0.1",
   "values": {
     "recovery_attempts": 10, // How many Tries before recovery of renderite gives up.
     "stable_seconds": 120, // Seconds before the recovery attempt count resets.
@@ -14,6 +14,7 @@
     "write_log_files": true, // Enables logging files. 
     "asset_quarantine": true, // Nullify assets that crash the renderer. Prevents from restoring an item that crashes the renderer again when restarted.
     "exit_when_recovery_fails": true, // Exit Resonite's main engine process if recovery gives up.
+    "save_worlds_on_crash": false, // When the renderer fails to recover, if enabled the worlds with unsaved changes should be auto saved.
     "journal_telemetry": false // Collect detailed journal telementry stats.
   }
 }

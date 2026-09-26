@@ -820,8 +820,14 @@ internal static class RecoveryCoordinator
             RenderiteRecoveryMod.Error(reason + " The engine and session stay alive with rendering suspended and no window (exit_when_recovery_fails is false). End Resonite from Task Manager when you are done.");
             return;
         }
-        RenderiteRecoveryMod.Error(reason + " Resonite is exiting normally, as if its window had been closed (exit_when_recovery_fails).");
         Engine engine = renderSystem.Engine;
+        if (!Settings.SaveWorldsOnCrash)
+        {
+            RenderiteRecoveryMod.Error(reason + " Resonite is force closing without saving (exit_when_recovery_fails, save_worlds_on_crash is false).");
+            ForceExit.Run(engine, "Force closing Resonite without saving after recovery gave up.");
+            return;
+        }
+        RenderiteRecoveryMod.Error(reason + " Resonite is exiting normally and saving, as if its window had been closed (exit_when_recovery_fails, save_worlds_on_crash).");
         try { engine.RequestShutdown(); }
         catch (Exception ex) { RenderiteRecoveryMod.Warn($"Could not start the normal exit: {ex.Message}"); }
         _ = Task.Run(async () =>
@@ -829,6 +835,17 @@ internal static class RecoveryCoordinator
             await Task.Delay(GiveUpExitTimeout).ConfigureAwait(false);
             ForceExit.Run(engine, $"Resonite did not finish exiting within {GiveUpExitTimeout.TotalMinutes:F0} minutes after recovery gave up, so it is being terminated.");
         });
+    }
+
+    internal static bool CloseAfterUnrecoveredFailure(RenderSystem renderSystem, Exception exception)
+    {
+        Engine engine = renderSystem.Engine;
+        if (Settings.SaveWorldsOnCrash || ForceExit.Requested || engine.ShutdownRequested || Userspace.IsExitingApp)
+            return false;
+
+        RenderiteRecoveryMod.Error($"The renderer connection failed and was not recovered. Resonite is force closing without saving (save_worlds_on_crash is false). Failure: {exception}");
+        ForceExit.Run(engine, "Force closing Resonite without saving after an unrecovered renderer failure.");
+        return true;
     }
 
     internal static void ResumeOnEngineThread(RenderSystem system)

@@ -23,12 +23,15 @@ internal static class ForceExit
             {
                 RenderSystem renderSystem = engine.RenderSystem;
                 Process? renderer = renderSystem.RendererProcess;
-                try { renderSystem.ShutdownRenderer(); }
-                catch (Exception ex) { RenderiteRecoveryMod.Warn($"Could not ask the renderer to close: {ex.Message}"); }
                 try
                 {
-                    if (renderer is not null && !renderer.HasExited && !renderer.WaitForExit(RendererCloseTimeout))
-                        renderer.Kill();
+                    if (renderer is not null && !renderer.HasExited)
+                    {
+                        try { renderSystem.ShutdownRenderer(); }
+                        catch (Exception ex) { RenderiteRecoveryMod.Warn($"Could not ask the renderer to close: {ex.Message}"); }
+                        if (!renderer.WaitForExit(RendererCloseTimeout))
+                            renderer.Kill();
+                    }
                 }
                 catch (Exception ex) { RenderiteRecoveryMod.Warn($"Could not stop the renderer: {ex.Message}"); }
                 UniLog.Flush();

@@ -66,6 +66,10 @@ internal static class Settings
         "If recovery fails all of its attempts to recover, we can keep the main engine running without exiting.",
         () => true);
 
+    internal static readonly ModConfigurationKey<bool> SaveWorldsOnCrashKey = new("save_worlds_on_crash",
+        "When the renderer fails to recover after all the recovery attempts are exhausted and exit_when_recovery_fails is enabled, Resonite has to close. When this is enabled it will pass the normal logic of resonite to try to save worlds you have changes in. When off, Resonite is force closed without saving anything.",
+        () => false);
+
     internal static readonly ModConfigurationKey<bool> JournalTelemetryKey = new("journal_telemetry",
         "Collects journal telemetry of what the recovery journal holds. The report is rewritten every 10 seconds in Logs/RenderiteRecovery.JournalTelemetry.txt. This costs some CPU while it is enabled, so leave it off unless you want to check performance stats.",
         () => false);
@@ -75,7 +79,7 @@ internal static class Settings
         RecoveryAttemptsKey, StableSecondsKey, JournalLimitMbKey,
         JournalEntryLimitKey, ArchiveDiskLimitMbKey, ArchiveDirectoryKey, ArchiveMemoryMbKey,
         CompactionThresholdMbKey, ShowDashPanelKey, ShowForceExitButtonKey, WriteLogFilesKey, AssetQuarantineKey,
-        ExitWhenRecoveryFailsKey, JournalTelemetryKey
+        ExitWhenRecoveryFailsKey, SaveWorldsOnCrashKey, JournalTelemetryKey
     ];
 
     private const long Megabyte = 1024L * 1024;
@@ -91,6 +95,7 @@ internal static class Settings
     internal static volatile bool WriteLogFiles = true;
     internal static volatile bool QuarantineAssets = true;
     internal static volatile bool ExitWhenRecoveryFails = true;
+    internal static volatile bool SaveWorldsOnCrash;
 
     internal static string FilePath { get; private set; } = "rml_config/RenderiteRecovery.json";
 
@@ -132,7 +137,7 @@ internal static class Settings
         RenderiteRecoveryMod.Msg($"Settings ({FilePath}): {Describe()}.");
     }
 
-    internal static string Describe() => $"recovery_attempts={RecoveryAttempts}, stable_seconds={StableSeconds}, journal_limit_mb={CommandJournal.ByteLimit / Megabyte}, journal_entry_limit={CommandJournal.EntryLimit}, archive_disk_limit_mb={PayloadArchiver.DiskLimit / Megabyte}, archive_directory=\"{Get(ArchiveDirectoryKey)}\" ({PayloadArchiver.Directory}), archive_memory_mb={PayloadArchiver.MemoryLimit / Megabyte}, compaction_threshold_mb={PayloadArchiver.CompactionThreshold / Megabyte}, show_dash_panel={ShowDashPanel}, show_force_exit_button={ShowForceExitButton}, write_log_files={WriteLogFiles}, asset_quarantine={QuarantineAssets}, exit_when_recovery_fails={ExitWhenRecoveryFails}, journal_telemetry={JournalTelemetry.Enabled}";
+    internal static string Describe() => $"recovery_attempts={RecoveryAttempts}, stable_seconds={StableSeconds}, journal_limit_mb={CommandJournal.ByteLimit / Megabyte}, journal_entry_limit={CommandJournal.EntryLimit}, archive_disk_limit_mb={PayloadArchiver.DiskLimit / Megabyte}, archive_directory=\"{Get(ArchiveDirectoryKey)}\" ({PayloadArchiver.Directory}), archive_memory_mb={PayloadArchiver.MemoryLimit / Megabyte}, compaction_threshold_mb={PayloadArchiver.CompactionThreshold / Megabyte}, show_dash_panel={ShowDashPanel}, show_force_exit_button={ShowForceExitButton}, write_log_files={WriteLogFiles}, asset_quarantine={QuarantineAssets}, exit_when_recovery_fails={ExitWhenRecoveryFails}, save_worlds_on_crash={SaveWorldsOnCrash}, journal_telemetry={JournalTelemetry.Enabled}";
 
     private static T Get<T>(ModConfigurationKey<T> key)
     {
@@ -163,6 +168,7 @@ internal static class Settings
         }
         QuarantineAssets = Get(AssetQuarantineKey);
         ExitWhenRecoveryFails = Get(ExitWhenRecoveryFailsKey);
+        SaveWorldsOnCrash = Get(SaveWorldsOnCrashKey);
         JournalTelemetry.SetEnabled(Get(JournalTelemetryKey));
     }
 

@@ -5,7 +5,7 @@ namespace RenderiteRecovery;
 
 public sealed class RenderiteRecoveryMod : ResoniteMod
 {
-    internal const string ModVersion = "2.0.0";
+    internal const string ModVersion = "2.0.1";
 
     public override string Name => "Renderite Recovery";
     public override string Author => "backwards";

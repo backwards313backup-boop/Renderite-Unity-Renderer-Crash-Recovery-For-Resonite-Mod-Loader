@@ -240,8 +240,13 @@ internal static class ComputeRenderUpdatePatch
 [HarmonyPatch(typeof(RenderSystem), "HandleFailure")]
 internal static class HandleFailurePatch
 {
-    private static bool Prefix(RenderSystem __instance, Exception exception) =>
-        !RecoveryCoordinator.Request(__instance, exception.Message);
+    private static bool Prefix(RenderSystem __instance, Exception exception)
+    {
+        if (RecoveryCoordinator.Request(__instance, exception.Message))
+            return false;
+
+        return !RecoveryCoordinator.CloseAfterUnrecoveredFailure(__instance, exception);
+    }
 }
 
 [HarmonyPatch(typeof(RenderSystem), "HandleCommand")]
